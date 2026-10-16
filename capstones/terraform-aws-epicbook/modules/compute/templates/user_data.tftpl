@@ -1,0 +1,118 @@
+#!/bin/bash
+
+set -e 
+
+# Output script logs for debugging
+exec > >(tee /var/log/user_data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+# Update, upgrade & install system dependencies
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git nginx curl build-essential jq mysql-client
+
+# Install Node.js 20 & PM2
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt update
+sudo apt install -y nodejs
+sudo npm install -g pm2
+
+# Start and enable Nginx
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
+# Clone the EpicBook app repository
+cd /home/ubuntu
+git clone https://github.com/Tobilee10/theepicbook.git
+cd theepicbook
+
+# Wait for database availability
+until mysqladmin ping -h "${db_host}" --silent; do
+    echo "Waiting for RDS database connection..."
+    sleep 10
+done
+
+# Create .env file for RDS Database Connection
+cat <<EOF > .env
+PORT=8080
+DB_HOST=${db_host}
+DB_PORT=3306
+DB_NAME=${db_name}
+DB_USER=${db_username}
+DB_PASSWORD=${db_password}
+NODE_ENV=development
+EOF
+
+chmod 600 .env
+chown ubuntu:ubuntu .env
+
+# Modify ONLY the "development" block in config/config.json using jq
+jq \
+  --arg host "${db_host}" \
+  --arg user "${db_username}" \
+  --arg pass "${db_password}" \
+  --arg db "${db_name}" \
+  '.development.host = $host | .development.username = $user | .development.password = $pass | .development.database = $db' \
+  config/config.json > config/config.tmp.json && mv config/config.tmp.json config/config.json
+
+# Database Setup & Seed Import
+export MYSQL_PWD="${db_password}"
+
+# Create database if it doesn't exist
+mysql -h "${db_host}" -u "${db_username}" -e "CREATE DATABASE IF NOT EXISTS ${db_name};"
+
+# Locate SQL files directory
+if [ -d "db" ]; then
+  cd db
+  
+  if [ -f "BuyTheBook_Schema.sql" ]; then
+    mysql -h "${db_host}" -u "${db_username}" "${db_name}" < BuyTheBook_Schema.sql
+  fi
+
+  if [ -f "author_seed.sql" ]; then
+    mysql -h "${db_host}" -u "${db_username}" "${db_name}" < author_seed.sql
+  fi
+
+  if [ -f "books_seed.sql" ]; then
+    mysql -h "${db_host}" -u "${db_username}" "${db_name}" < books_seed.sql
+  fi
+
+  cd /home/ubuntu/theepicbook
+fi
+
+# Install dependencies
+npm install
+
+# Write Nginx reverse proxy configuration
+sudo bash -c 'cat > /etc/nginx/sites-available/epicbook << EOF
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF'
+
+# Enable site by creating symlink and removing default
+sudo ln -sf /etc/nginx/sites-available/epicbook /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# Test configuration and restart Nginx
+sudo nginx -t
+sudo systemctl restart nginx
+sudo systemctl enable nginx
+
+# Fix directory permissions
+sudo chown -R ubuntu:ubuntu /home/ubuntu/theepicbook
+
+# Start application using PM2 on port 8080
+sudo -u ubuntu PORT=8080 pm2 start npm --name "epicbook" -- start
+sudo -u ubuntu pm2 save
+
+# Ensure PM2 restarts on system reboot
+env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u ubuntu --hp /home/ubuntu
